@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script>
+      // Complete suppression of browser-extension-injected errors (e.g. Talisman onboarding messages)
+      (function() {
+        if (typeof window === "undefined") return;
+
+        var isExtensionError = function(msg) {
+          if (!msg) return false;
+          var m = String(msg).toLowerCase();
+          return m.indexOf("talisman") !== -1 || 
+                 m.indexOf("extension has not been configured yet") !== -1 ||
+                 m.indexOf("onboarding") !== -1;
+        };
+
+        // 1. Capture-phase window event listeners for synchronous errors
+        window.addEventListener('error', function(e) {
+          var errorMsg = String(e.message || "") + " " + String(e.error && e.error.message || "");
+          if (isExtensionError(errorMsg)) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+
+        // 2. Capture-phase window event listeners for microtask/async promise rejections
+        window.addEventListener('unhandledrejection', function(e) {
+          var reason = e.reason;
+          var errorMsg = String(reason && reason.message || reason || "");
+          if (isExtensionError(errorMsg)) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+          }
+        }, true);
+
+        // 3. Fallback standard onerror handler
+        var oldOnError = window.onerror;
+        window.onerror = function(message, source, lineno, colno, error) {
+          var errorMsg = String(message || "") + " " + String(error && error.message || "");
+          if (isExtensionError(errorMsg)) {
+            return true; // completely supresses the error and stops further bubbling
+          }
+          if (oldOnError) {
+            return oldOnError.apply(this, arguments);
+          }
+          return false;
+        };
+
+        // 4. Console log filtering
+        var oldConsoleError = console.error;
+        console.error = function() {
+          var args = Array.prototype.slice.call(arguments);
+          var message = args.map(function(arg) {
+            if (arg instanceof Error) return arg.message + " " + arg.stack;
+            try {
+              return typeof arg === 'object' ? JSON.stringify(arg) : String(arg);
+            } catch(e) {
+              return String(arg);
+            }
+          }).join(" ");
+          if (isExtensionError(message)) {
+            return;
+          }
+          oldConsoleError.apply(console, arguments);
+        };
+
+        var oldConsoleWarn = console.warn;
+        console.warn = function() {
+          var args = Array.prototype.slice.call(arguments);
+          var message = args.map(function(arg) {
+            try {
+              return typeof arg === 'object' ? JSON.stringify(arg) : String(arg);
+            } catch(e) {
+              return String(arg);
+            }
+          }).join(" ");
+          if (isExtensionError(message)) {
+            return;
+          }
+          oldConsoleWarn.apply(console, arguments);
+        };
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>My Google AI Studio App</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
