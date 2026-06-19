@@ -4,9 +4,9 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { ShieldCheck, Eye, EyeOff, Swords, Compass, Map, Lock, Zap, Sparkles, Flame, Wind } from "lucide-react";
+import { ShieldCheck, Eye, EyeOff, Swords, Compass, Map, Lock, Zap, Sparkles, Flame, Wind, MapPin } from "lucide-react";
 import { BiomeType, BiomeConfig, MapSettings, PlayerState, SpawnPoint } from "../types";
-import { ref, onValue, set, remove, update, onChildAdded } from "firebase/database";
+import { ref, onValue, set, remove, update, onChildAdded, push, query, limitToLast } from "firebase/database";
 import { db } from "../lib/firebase";
 
 // Biome Colors and config matching original design
@@ -16,7 +16,10 @@ export const BIOMES: Record<BiomeType, BiomeConfig> = {
   GRASS: { id: 2, c1: "#4caf50", c2: "#45a049", name: "Łąka" },
   FOREST: { id: 3, c1: "#1e8449", c2: "#196f3d", name: "Las" },
   RAINFOREST: { id: 4, c1: "#117a65", c2: "#0e6251", name: "Las Deszczowy" },
-  MOUNTAIN: { id: 5, c1: "#7f8c8d", c2: "#95a5a6", name: "Góry" }
+  MOUNTAIN: { id: 5, c1: "#7f8c8d", c2: "#95a5a6", name: "Góry" },
+  LAVA: { id: 6, c1: "#cf1010", c2: "#ff4500", name: "Lawa" },
+  ICE: { id: 7, c1: "#bdecff", c2: "#5dade2", name: "Lodowiec" },
+  SWAMP: { id: 8, c1: "#3c4d3d", c2: "#1c281d", name: "Bagna" }
 };
 
 interface GameCanvasProps {
@@ -49,12 +52,17 @@ export function getNoiseTileAt(x: number, y: number, mapW: number, mapH: number)
   const n = getSmoothNoise(boundedX, boundedY);
   const riverNoise = Math.abs(Math.sin(boundedX * 0.08) + Math.cos(boundedY * 0.08));
 
-  if (n < -2.2 || riverNoise < 0.08) return "WATER";
+  if (n < -2.2 || riverNoise < 0.08) {
+    if (n < -3.1) return "LAVA";
+    return "WATER";
+  }
   if (n < -1.2) return "SAND";
+  if (n < -0.3) return "SWAMP";
   if (n < 0.8) return "GRASS";
   if (n < 2.2) return "FOREST";
-  if (n < 3.8) return "RAINFOREST";
-  return "MOUNTAIN";
+  if (n < 3.5) return "RAINFOREST";
+  if (n < 4.4) return "MOUNTAIN";
+  return "ICE";
 }
 
 export function MathNoise(x: number, y: number): number {
@@ -76,6 +84,19 @@ export default function GameCanvas({
 }: GameCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  const logGlobalEvent = (text: string, type: string = "system") => {
+    try {
+      const eventsRef = ref(db, "globalEvents");
+      push(eventsRef, {
+        text,
+        type,
+        timestamp: Date.now()
+      });
+    } catch(e) {
+      console.warn("Global event write aborted:", e);
+    }
+  };
+
   // Score metrics
   const [score, setScore] = useState(0);
 
@@ -87,6 +108,8 @@ export default function GameCanvas({
   const [playerLvl, setPlayerLvl] = useState(1);
   const [playerXp, setPlayerXp] = useState(0);
   const [playerXpNeeded, setPlayerXpNeeded] = useState(100);
+  const [pvpProtected, setPvpProtected] = useState(true);
+  const [pvpProtectedTimeLeft, setPvpProtectedTimeLeft] = useState(60);
 
   // Spell states
   const [selectedSpell, setSelectedSpell] = useState<1 | 2 | 3>(1);
@@ -97,6 +120,7 @@ export default function GameCanvas({
 
   const castSpellRef = useRef<((id: 1 | 2 | 3) => void) | null>(null);
   const triggerDashRef = useRef<(() => void) | null>(null);
+  const triggerPingCommandRef = useRef<((type: "ping" | "look") => void) | null>(null);
   const selectedSpellRef = useRef<1 | 2 | 3>(1);
 
   // Keep the ref in sync with selected spell for canvas keyboard checks
@@ -128,6 +152,9 @@ export default function GameCanvas({
   const [isFullScreenMinimap, setIsFullScreenMinimap] = useState(false);
   const isFullScreenMinimapRef = useRef(false);
   isFullScreenMinimapRef.current = isFullScreenMinimap;
+
+  const [globalEvents, setGlobalEvents] = useState<any[]>([]);
+  const hasLoggedJoin = useRef(false);
   const playerRef = useRef({ worldX: 0, worldY: 0 });
   const otherPlayersRef = useRef<Record<string, any>>({});
   const enemiesRef = useRef<any[]>([]);
@@ -156,6 +183,253 @@ export default function GameCanvas({
 
     let animFrameId: number;
     let isRunning = true;
+    let audioCtx: AudioContext | null = null;
+
+    const playPingSound = (isLook: boolean) => {
+      try {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume();
+        }
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        osc.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        if (isLook) {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(329.63, now); // E4
+          osc.frequency.exponentialRampToValueAtTime(493.88, now + 0.15); // B4
+          gainNode.gain.setValueAtTime(0, now);
+          gainNode.gain.linearRampToValueAtTime(0.08, now + 0.04);
+          gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+          osc.start(now);
+          osc.stop(now + 0.4);
+        } else {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(523.25, now); // C5
+          osc.frequency.setValueAtTime(659.25, now + 0.08); // E5
+          osc.frequency.setValueAtTime(783.99, now + 0.16); // G5
+          gainNode.gain.setValueAtTime(0, now);
+          gainNode.gain.linearRampToValueAtTime(0.09, now + 0.05);
+          gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.42);
+          osc.start(now);
+          osc.stop(now + 0.45);
+        }
+      } catch (e) {
+        console.warn(e);
+      }
+    };
+
+    const initAudio = () => {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+    };
+
+    const playAmbientSfx = (type: "rain_drip" | "wind" | "howl" | "bird" | "bat" | "growl" | "splash") => {
+      try {
+        initAudio();
+        if (!audioCtx) return;
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        if (type === "rain_drip") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(1200 + Math.random() * 800, now);
+          osc.frequency.exponentialRampToValueAtTime(120 + Math.random() * 100, now + 0.04);
+          gain.gain.setValueAtTime(0.005 + Math.random() * 0.005, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.04);
+          osc.start(now);
+          osc.stop(now + 0.05);
+        } else if (type === "wind") {
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(110 + Math.sin(now * 3) * 20, now);
+          osc.frequency.linearRampToValueAtTime(140, now + 0.5);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.012, now + 0.25);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+          osc.start(now);
+          osc.stop(now + 0.5);
+        } else if (type === "howl") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(180, now);
+          osc.frequency.exponentialRampToValueAtTime(400, now + 0.6);
+          osc.frequency.linearRampToValueAtTime(430, now + 1.2);
+          osc.frequency.exponentialRampToValueAtTime(200, now + 2.2);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.05, now + 0.4);
+          gain.gain.linearRampToValueAtTime(0.05, now + 1.4);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 2.2);
+          osc.start(now);
+          osc.stop(now + 2.2);
+        } else if (type === "bird") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(1200 + Math.random() * 200, now);
+          osc.frequency.exponentialRampToValueAtTime(1800, now + 0.08);
+          osc.frequency.setValueAtTime(1300, now + 0.12);
+          osc.frequency.exponentialRampToValueAtTime(2000, now + 0.22);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.02, now + 0.04);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+          osc.start(now);
+          osc.stop(now + 0.28);
+        } else if (type === "bat") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(6000 + Math.random() * 1500, now);
+          osc.frequency.exponentialRampToValueAtTime(3000, now + 0.05);
+          gain.gain.setValueAtTime(0.015, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+          osc.start(now);
+          osc.stop(now + 0.07);
+        } else if (type === "growl") {
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(85, now);
+          osc.frequency.linearRampToValueAtTime(130, now + 0.15);
+          osc.frequency.linearRampToValueAtTime(65, now + 0.35);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.04, now + 0.08);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.4);
+          osc.start(now);
+          osc.stop(now + 0.4);
+        } else if (type === "splash") {
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(170, now);
+          osc.frequency.exponentialRampToValueAtTime(45, now + 0.12);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.07, now + 0.03);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+          osc.start(now);
+          osc.stop(now + 0.16);
+        }
+      } catch (e) {
+        console.warn(e);
+      }
+    };
+
+    const playInteractionSound = (type: "slash" | "frost_nova" | "ground_slam" | "blade_whirl" | "lava_explosion" | "pickup" | "level_up" | "hit_damage" | "shoot") => {
+      try {
+        initAudio();
+        if (!audioCtx) return;
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        if (type === "slash") {
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(240, now);
+          osc.frequency.exponentialRampToValueAtTime(75, now + 0.15);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.1, now + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+          osc.start(now);
+          osc.stop(now + 0.16);
+        } else if (type === "frost_nova") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(750, now);
+          osc.frequency.exponentialRampToValueAtTime(1550, now + 0.25);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.08, now + 0.05);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+          osc.start(now);
+          osc.stop(now + 0.32);
+        } else if (type === "ground_slam") {
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(75, now);
+          osc.frequency.exponentialRampToValueAtTime(22, now + 0.35);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.18, now + 0.05);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.4);
+          osc.start(now);
+          osc.stop(now + 0.42);
+        } else if (type === "blade_whirl") {
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(210, now);
+          osc.frequency.linearRampToValueAtTime(310, now + 0.12);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.05, now + 0.03);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+          osc.start(now);
+          osc.stop(now + 0.22);
+        } else if (type === "lava_explosion") {
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(130, now);
+          osc.frequency.exponentialRampToValueAtTime(28, now + 0.45);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.15, now + 0.06);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+          osc.start(now);
+          osc.stop(now + 0.52);
+        } else if (type === "hit_damage") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(310, now);
+          osc.frequency.linearRampToValueAtTime(110, now + 0.1);
+          gain.gain.setValueAtTime(0.12, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.11);
+          osc.start(now);
+          osc.stop(now + 0.12);
+        } else if (type === "shoot") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(440, now);
+          osc.frequency.exponentialRampToValueAtTime(880, now + 0.1);
+          gain.gain.setValueAtTime(0.07, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+          osc.start(now);
+          osc.stop(now + 0.13);
+        } else if (type === "pickup") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(523.25, now);
+          osc.frequency.exponentialRampToValueAtTime(1046.50, now + 0.15);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.08, now + 0.03);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+          osc.start(now);
+          osc.stop(now + 0.28);
+        } else if (type === "level_up") {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(261.63, now);
+          osc.frequency.setValueAtTime(329.63, now + 0.08);
+          osc.frequency.setValueAtTime(392.00, now + 0.16);
+          osc.frequency.setValueAtTime(523.25, now + 0.24);
+          gain.gain.setValueAtTime(0, now);
+          gain.gain.linearRampToValueAtTime(0.12, now + 0.05);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
+          osc.start(now);
+          osc.stop(now + 0.65);
+        }
+      } catch (e) {
+        console.warn(e);
+      }
+    };
+
+    const createExplosionParticles = (x: number, y: number, color: string, count = 12, speed = 2.5) => {
+      for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const s = (0.4 + Math.random() * 0.6) * speed;
+        visualEffects.push({
+          type: "particle",
+          worldX: x,
+          worldY: y,
+          vx: Math.cos(angle) * s,
+          vy: Math.sin(angle) * s,
+          gravity: 0.05,
+          color: color,
+          size: 1.5 + Math.random() * 3,
+          life: 20 + Math.floor(Math.random() * 20),
+          maxLife: 40
+        });
+      }
+    };
 
     // Canvas size
     const resizeCanvas = () => {
@@ -212,6 +486,22 @@ export default function GameCanvas({
       }
     });
 
+    const eventsQuery = query(ref(db, "globalEvents"), limitToLast(12));
+    const unsubscribeEvents = onValue(eventsQuery, (snapshot) => {
+      if (!isRunning) return;
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        const list: any[] = [];
+        for (const key in val) {
+          list.push({ id: key, ...val[key] });
+        }
+        list.sort((a, b) => a.timestamp - b.timestamp);
+        setGlobalEvents(list);
+      } else {
+        setGlobalEvents([]);
+      }
+    });
+
     const isHost = () => {
       const activeUsernames = Object.keys(otherPlayers).concat(currentUser).sort();
       return activeUsernames[0] === currentUser;
@@ -223,12 +513,25 @@ export default function GameCanvas({
       if (!isHost()) {
         if (snapshot.exists()) {
           const val = snapshot.val();
-          const list: any[] = [];
+          const newEnemies: any[] = [];
           for (const key in val) {
-            list.push({ id: key, ...val[key] });
+            const serverE = { id: key, ...val[key] };
+            const existingE = enemies.find(e => e.id === key);
+            if (existingE) {
+              existingE.targetX = serverE.worldX;
+              existingE.targetY = serverE.worldY;
+              existingE.hp = serverE.hp;
+              existingE.state = serverE.state;
+              existingE.alertProgress = serverE.alertProgress || 0;
+              newEnemies.push(existingE);
+            } else {
+              serverE.targetX = serverE.worldX;
+              serverE.targetY = serverE.worldY;
+              newEnemies.push(serverE);
+            }
           }
           enemies.length = 0;
-          enemies.push(...list);
+          enemies.push(...newEnemies);
         } else {
           enemies.length = 0;
         }
@@ -241,12 +544,23 @@ export default function GameCanvas({
       if (!isHost()) {
         if (snapshot.exists()) {
           const val = snapshot.val();
-          const list: any[] = [];
+          const newAnimals: any[] = [];
           for (const key in val) {
-            list.push({ id: key, ...val[key] });
+            const serverA = { id: key, ...val[key] };
+            const existingA = animals.find(a => a.id === key);
+            if (existingA) {
+              existingA.targetX = serverA.worldX;
+              existingA.targetY = serverA.worldY;
+              existingA.hp = serverA.hp;
+              newAnimals.push(existingA);
+            } else {
+              serverA.targetX = serverA.worldX;
+              serverA.targetY = serverA.worldY;
+              newAnimals.push(serverA);
+            }
           }
           animals.length = 0;
-          animals.push(...list);
+          animals.push(...newAnimals);
         } else {
           animals.length = 0;
         }
@@ -266,6 +580,30 @@ export default function GameCanvas({
         loots.push(...list);
       } else {
         loots.length = 0;
+      }
+    });
+
+    const messagesRef = ref(db, "messages");
+    const connectionTime = Date.now();
+    const unsubscribeMessages = onChildAdded(messagesRef, (snapshot) => {
+      if (!isRunning) return;
+      const m = snapshot.val();
+      if (m && m.timestamp >= connectionTime - 1500) {
+        if (m.worldX !== undefined && m.worldY !== undefined) {
+          const type = m.type || "ping";
+          visualEffects.push({
+            type: "ping_pulse",
+            worldX: m.worldX,
+            worldY: m.worldY,
+            user: m.user,
+            life: 90,
+            maxLife: 90,
+            color: type === "look" ? "#ff4757" : "#00ffcc",
+            pingType: type,
+            text: type === "look" ? `SPÓJRZ: @${m.user}` : `SYGNAŁ: @${m.user}`
+          });
+          playPingSound(type === "look");
+        }
       }
     });
 
@@ -323,23 +661,45 @@ export default function GameCanvas({
             life: b.life,
             maxLife: 35
           });
-        } else {
-          if (!bullets.some(item => item.id === b.id)) {
-            bullets.push({
-              id: b.id,
-              shooter: b.shooter,
-              type: b.type,
-              worldX: b.worldX,
-              worldY: b.worldY,
-              vx: b.vx,
-              vy: b.vy,
-              radius: b.radius,
-              life: b.life,
-              damage: b.damage,
-              angle: b.angle,
-              animFrame: 0
-            });
+        }
+
+        if (!bullets.some(item => item.id === b.id)) {
+          let bRadius = b.radius || 12;
+          let bDamage = b.damage || 15;
+          let bVx = b.vx || 0;
+          let bVy = b.vy || 0;
+
+          if (b.type === "slash") {
+            bRadius = 45;
+            bDamage = b.damage || 35;
+          } else if (b.type === "frost_nova") {
+            bRadius = 110;
+            bDamage = b.damage || 30;
+          } else if (b.type === "ground_slam") {
+            bRadius = 120;
+            bDamage = b.damage || 35;
+          } else if (b.type === "blade_whirl") {
+            bRadius = 75;
+            bDamage = b.damage || 15;
+          } else if (b.type === "lava_explosion") {
+            bRadius = 160;
+            bDamage = b.damage || 45;
           }
+
+          bullets.push({
+            id: b.id,
+            shooter: b.shooter,
+            type: b.type,
+            worldX: b.worldX,
+            worldY: b.worldY,
+            vx: bVx,
+            vy: bVy,
+            radius: bRadius,
+            life: b.life,
+            damage: bDamage,
+            angle: b.angle || 0,
+            animFrame: 0
+          });
         }
       }
     });
@@ -389,6 +749,18 @@ export default function GameCanvas({
       if (e.key === "Shift") {
         e.preventDefault();
         triggerDash();
+      }
+      if (key === "l") {
+        e.preventDefault();
+        triggerPingCommandRef.current?.("look");
+      }
+      if (key === "p") {
+        e.preventDefault();
+        triggerPingCommandRef.current?.("ping");
+      }
+      if (key === "control" || key === "ctrl") {
+        e.preventDefault();
+        triggerPlayerAttack();
       }
     };
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -458,7 +830,9 @@ export default function GameCanvas({
       stamina: initialStaminaAttr,
       maxStamina: initialStamina,
       currentStamina: initialStamina,
-      isRunning: false
+      isRunning: false,
+      speed: 0,
+      protectionUntil: Date.now() + 15000
     };
 
     // Update state to React HUD initially
@@ -469,6 +843,11 @@ export default function GameCanvas({
     setPlayerLvl(player.level);
     setPlayerXp(player.xp);
     setPlayerXpNeeded(player.xpNeeded);
+
+    if (!hasLoggedJoin.current) {
+      hasLoggedJoin.current = true;
+      logGlobalEvent(`⚔️ Gracz @${currentUser} wkroczył do świata gry!`, "join");
+    }
     
     // Sync initial attribute states to React views
     setPlayerStamina(player.currentStamina);
@@ -550,6 +929,9 @@ export default function GameCanvas({
               maxLife: 25
             });
 
+            playInteractionSound("frost_nova");
+            createExplosionParticles(player.worldX, player.worldY, "#33ccff", 16, 2.8);
+
             const bId = `fn_${currentUser}_${Date.now()}`;
             set(ref(db, `bullets/active/${bId}`), {
               id: bId,
@@ -612,6 +994,9 @@ export default function GameCanvas({
               life: 25,
               maxLife: 25
             });
+
+            playInteractionSound("ground_slam");
+            createExplosionParticles(player.worldX, player.worldY, "#e67e22", 15, 3.2);
 
             const bId = `gs_${currentUser}_${Date.now()}`;
             set(ref(db, `bullets/active/${bId}`), {
@@ -925,6 +1310,22 @@ export default function GameCanvas({
     triggerDashRef.current = () => {
       triggerDash();
     };
+    triggerPingCommandRef.current = (type: "ping" | "look") => {
+      const messagesRef = ref(db, "messages");
+      const text = type === "look"
+        ? "[👀 Spójrz na moją pozycję!]"
+        : "[📍 Wysłałem sygnał lokalizacji]";
+      push(messagesRef, {
+        user: currentUser,
+        text: text,
+        timestamp: Date.now(),
+        worldX: player.worldX,
+        worldY: player.worldY,
+        type: type
+      }).catch((err) => {
+        console.error("Failed to push ping message:", err);
+      });
+    };
     toggleRunningRef.current = () => {
       player.isRunning = !player.isRunning;
       setIsRunning(player.isRunning);
@@ -1060,6 +1461,10 @@ export default function GameCanvas({
           };
           bullets.push(bPayload);
           set(ref(db, `bullets/active/${bulletId}`), bPayload);
+          
+          playInteractionSound("shoot");
+          createExplosionParticles(player.worldX, player.worldY, "#00d2ff", 5, 2.0);
+          
           player.attackCooldown = 18;
         }
       } else if (player.charClass === "wojownik") {
@@ -1096,6 +1501,9 @@ export default function GameCanvas({
           };
           set(ref(db, `bullets/active/${slashId}`), sPayload);
 
+          playInteractionSound("slash");
+          createExplosionParticles(player.worldX, player.worldY, "#e74c3c", 4, 1.8);
+
           const range = 85;
           const ax = player.worldX + Math.cos(player.angle) * 40;
           const ay = player.worldY + Math.sin(player.angle) * 40;
@@ -1111,6 +1519,9 @@ export default function GameCanvas({
               if (e.id) {
                 set(ref(db, `monsters/${e.id}/hp`), e.hp);
               }
+
+              playInteractionSound("hit_damage");
+              createExplosionParticles(e.worldX, e.worldY, "#ff3333", 8, 2.5);
 
               if (e.state !== "aggressive") {
                 e.state = "aggressive";
@@ -1151,6 +1562,10 @@ export default function GameCanvas({
               if (a.id) {
                 set(ref(db, `animals/${a.id}/hp`), a.hp);
               }
+
+              playInteractionSound("hit_damage");
+              createExplosionParticles(a.worldX, a.worldY, "#ffffff", 8, 2.2);
+
               if (a.hp <= 0) {
                 if (a.id) {
                   remove(ref(db, `animals/${a.id}`));
@@ -1193,6 +1608,10 @@ export default function GameCanvas({
           };
           bullets.push(bPayload);
           set(ref(db, `bullets/active/${bulletId}`), bPayload);
+          
+          playInteractionSound("shoot");
+          createExplosionParticles(player.worldX, player.worldY, "#2ecc71", 5, 2.3);
+          
           player.attackCooldown = 9;
         }
       }
@@ -1217,6 +1636,8 @@ export default function GameCanvas({
         player.skillPoints += 3;
         player.statPoints += 4;
         player.xpNeeded = Math.floor(player.xpNeeded * 1.55);
+
+        logGlobalEvent(`⭐ Awans! Gracz @${currentUser} awansował na poziom ${player.level}!`, "level");
 
         // Max out stats and stamina on level up
         player.maxHp = Math.floor(player.maxHp * 1.05);
@@ -1475,8 +1896,228 @@ export default function GameCanvas({
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
 
+    // Web Audio API Audio Manager for Invulnerability States (reuses top-level audioCtx)
+    const playProtectionSound = (isStarting: boolean) => {
+      try {
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume();
+        }
+        
+        const now = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        
+        osc.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        
+        if (isStarting) {
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(220, now);
+          osc.frequency.exponentialRampToValueAtTime(554.37, now + 0.4);
+          
+          gainNode.gain.setValueAtTime(0, now);
+          gainNode.gain.linearRampToValueAtTime(0.12, now + 0.1);
+          gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+          osc.start(now);
+          osc.stop(now + 0.5);
+        } else {
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(392, now);
+          osc.frequency.exponentialRampToValueAtTime(196, now + 0.5);
+          
+          gainNode.gain.setValueAtTime(0, now);
+          gainNode.gain.linearRampToValueAtTime(0.1, now + 0.05);
+          gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.55);
+          osc.start(now);
+          osc.stop(now + 0.6);
+        }
+      } catch (err) {
+        console.warn("Web Audio API warning: ", err);
+      }
+    };
+
+    const respawnPlayer = (killedBy?: string) => {
+      const freshHp = charClass === "wojownik" ? 140 : charClass === "lucznik" ? 105 : 75;
+      const freshMana = charClass === "mag" ? 160 : charClass === "lucznik" ? 100 : 70;
+      const freshStamina = charClass === "lucznik" ? 140 : charClass === "mag" ? 110 : 80;
+      const freshStrengthAttr = charClass === "wojownik" ? 14 : charClass === "mag" ? 4 : 8;
+      const freshEnergyAttr = charClass === "mag" ? 16 : charClass === "lucznik" ? 10 : 6;
+      const freshLifeAttr = charClass === "wojownik" ? 14 : charClass === "lucznik" ? 10 : 7;
+      const freshStaminaAttr = charClass === "lucznik" ? 14 : charClass === "mag" ? 11 : 8;
+
+      player.hp = freshHp;
+      player.maxHp = freshHp;
+      player.mana = freshMana;
+      player.maxMana = freshMana;
+      player.currentStamina = freshStamina;
+      player.maxStamina = freshStamina;
+      player.strength = freshStrengthAttr;
+      player.energy = freshEnergyAttr;
+      player.life = freshLifeAttr;
+      player.stamina = freshStaminaAttr;
+      player.level = 1;
+      player.xp = 0;
+      player.xpNeeded = 100;
+      player.skillPoints = 0;
+      player.statPoints = 0;
+      player.isRunning = false;
+      player.bulletDamage = charClass === "wojownik" ? 52 : charClass === "mag" ? 36 : 28;
+      player.speed = 0;
+
+      player.worldX = mapSettingsRef.current.width * 32;
+      player.worldY = mapSettingsRef.current.height * 32;
+      player.vx = 0;
+      player.vy = 0;
+
+      player.protectionUntil = Date.now() + 15000;
+
+      setScore(0);
+      statsRef.current.score = 0;
+      enemies.length = 0;
+      bullets.length = 0;
+      enemyBullets.length = 0;
+      setBossUiActive(false);
+
+      try {
+        playProtectionSound(true);
+      } catch (e) {
+        console.error(e);
+      }
+
+      setPlayerHp(player.hp);
+      setPlayerMaxHp(player.maxHp);
+      setPlayerMana(player.mana);
+      setPlayerMaxMana(player.maxMana);
+      setPlayerLvl(player.level);
+      setPlayerXp(player.xp);
+      setPlayerXpNeeded(player.xpNeeded);
+      setStatPoints(player.statPoints);
+      setStatStrength(player.strength);
+      setStatEnergy(player.energy);
+      setStatLife(player.life);
+      setStatStaminaStat(player.stamina);
+      setStatSpeed(0);
+
+      onGameStatsUpdated(1, 0);
+
+      set(ref(db, `players/${currentUser}`), {
+        username: currentUser,
+        worldX: player.worldX,
+        worldY: player.worldY,
+        angle: player.angle,
+        charClass: player.charClass,
+        hp: player.hp,
+        maxHp: player.maxHp,
+        level: player.level,
+        score: statsRef.current.score,
+        lastUpdate: Date.now(),
+        protectionUntil: player.protectionUntil
+      });
+
+      const messageText = killedBy 
+        ? `ODRODZENIE po porażce z ${killedBy}! (Ochrona 1 min.)` 
+        : `ODRODZENIE! (Ochrona PvP na 1 minutę)`;
+
+      visualEffects.push({
+        type: "damage_flash",
+        worldX: player.worldX,
+        worldY: player.worldY,
+        life: 150,
+        maxLife: 150,
+        text: messageText,
+        color: "#00ffcc"
+      });
+    };
+
+    let lastKilledBy: string | undefined = undefined;
+
+    const damagePlayer = (amount: number, source: string) => {
+      if (player.hp <= 0) return;
+      
+      const isProtected = player.protectionUntil && player.protectionUntil > Date.now();
+      if (isProtected) {
+        visualEffects.push({
+          type: "damage_flash",
+          worldX: player.worldX,
+          worldY: player.worldY,
+          life: 25,
+          maxLife: 25,
+          text: "BLOK",
+          color: "#00ffcc"
+        });
+        return;
+      }
+
+      player.hp = Math.max(0, player.hp - amount);
+      setPlayerHp(player.hp);
+      triggerCameraShake(11, 4);
+      playInteractionSound("hit_damage");
+      createExplosionParticles(player.worldX, player.worldY, "#ff3333", 15, 3.2);
+
+      visualEffects.push({
+        type: "damage_flash",
+        worldX: player.worldX,
+        worldY: player.worldY,
+        life: 20,
+        maxLife: 20,
+        text: `-${amount}`,
+        color: "#ff3333"
+      });
+
+      if (player.hp <= 0) {
+        lastKilledBy = source;
+        logGlobalEvent(`☠️ Gracz @${currentUser} został pokonany przez ${source}!`, "death");
+      }
+    };
+
+    // Play startup protection sound on first user action, to bypass autoplay policy
+    const triggerAudioStartup = () => {
+      try {
+        playProtectionSound(true);
+      } catch(e) {}
+      window.removeEventListener("click", triggerAudioStartup);
+      window.removeEventListener("keydown", triggerAudioStartup);
+    };
+    window.addEventListener("click", triggerAudioStartup);
+    window.addEventListener("keydown", triggerAudioStartup);
+
     // Real-time loop calculations
     const updateGameElements = () => {
+      // Check if protection ended
+      if (player.protectionUntil) {
+        const diff = player.protectionUntil - Date.now();
+        if (diff <= 0) {
+          player.protectionUntil = undefined;
+          setPvpProtected(false);
+          setPvpProtectedTimeLeft(0);
+          try {
+            playProtectionSound(false);
+          } catch (e) {
+            console.error(e);
+          }
+          visualEffects.push({
+            type: "damage_flash",
+            worldX: player.worldX,
+            worldY: player.worldY,
+            life: 100,
+            maxLife: 100,
+            text: "OKRES OCHRONNY MINĄŁ!",
+            color: "#e74c3c"
+          });
+        } else {
+          setPvpProtected(true);
+          setPvpProtectedTimeLeft(Math.ceil(diff / 1000));
+        }
+      } else {
+        if (pvpProtected) {
+          setPvpProtected(false);
+          setPvpProtectedTimeLeft(0);
+        }
+      }
+
       runWeatherCycle();
 
       // Decrement skill and dash cooldowns every frame
@@ -1515,7 +2156,22 @@ export default function GameCanvas({
       if (windriderActiveTimer > 0) {
         finalMaxSpeed *= 1.85; // extreme speedup under Windrider ultimate!
       }
-      const speedModifier = currentMapTile === "WATER" ? 0.52 : 1.0;
+      let speedModifier = 1.0;
+      let frictionModifier = 1.0;
+      if (currentMapTile === "WATER") {
+        speedModifier = 0.52;
+      } else if (currentMapTile === "LAVA") {
+        speedModifier = 0.38;
+        const isLavaProtected = player.protectionUntil && player.protectionUntil > Date.now();
+        if (!isLavaProtected && Math.random() < 0.012) {
+          damagePlayer(1, "Gorąca Lawa");
+        }
+      } else if (currentMapTile === "ICE") {
+        speedModifier = 1.35;
+        frictionModifier = 1.12;
+      } else if (currentMapTile === "SWAMP") {
+        speedModifier = 0.44;
+      }
       let maxSpeedLimit = finalMaxSpeed * speedModifier;
       
       // Run mode handling
@@ -1585,13 +2241,24 @@ export default function GameCanvas({
 
       player.vx += ax;
       player.vy += ay;
-      player.vx *= player.friction;
-      player.vy *= player.friction;
+      
+      const currentFriction = Math.min(0.985, player.friction * frictionModifier);
+      player.vx *= currentFriction;
+      player.vy *= currentFriction;
 
       const actSpeed = Math.sqrt(player.vx * player.vx + player.vy * player.vy);
       if (actSpeed > maxSpeedLimit) {
         player.vx = (player.vx / actSpeed) * maxSpeedLimit;
         player.vy = (player.vy / actSpeed) * maxSpeedLimit;
+      }
+
+      if (isMoving && actSpeed > 0.6) {
+        if (currentMapTile === "WATER") {
+          if (Math.random() < 0.08) {
+            playAmbientSfx("splash");
+            createExplosionParticles(player.worldX, player.worldY, "rgba(255,255,255,0.45)", 4, 1.2);
+          }
+        }
       }
 
       // Border constraints (keep inside the grid dynamically, support Dash movement and invincibility frames)
@@ -1666,21 +2333,25 @@ export default function GameCanvas({
             }
           });
 
-          // Find closest online competitor
-          Object.keys(otherPlayers).forEach((pName) => {
-            if (pName !== currentUser) {
-              const op = otherPlayers[pName];
-              if (op) {
-                const dx = op.worldX - b.worldX;
-                const dy = op.worldY - b.worldY;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                if (dist < minDistance) {
-                  minDistance = dist;
-                  closestTarget = { x: op.worldX, y: op.worldY };
+          // Find closest online competitor (only if shooter is NOT protected and target is NOT protected)
+          const bShooterIsProtected = player.protectionUntil && player.protectionUntil > Date.now();
+          if (!bShooterIsProtected) {
+            Object.keys(otherPlayers).forEach((pName) => {
+              if (pName !== currentUser) {
+                const op = otherPlayers[pName];
+                const opIsProtected = op && op.protectionUntil && op.protectionUntil > Date.now();
+                if (op && !opIsProtected) {
+                  const dx = op.worldX - b.worldX;
+                  const dy = op.worldY - b.worldY;
+                  const dist = Math.sqrt(dx * dx + dy * dy);
+                  if (dist < minDistance) {
+                    minDistance = dist;
+                    closestTarget = { x: op.worldX, y: op.worldY };
+                  }
                 }
               }
-            }
-          });
+            });
+          }
 
           if (closestTarget) {
             const trg: { x: number; y: number } = closestTarget;
@@ -1709,83 +2380,29 @@ export default function GameCanvas({
           const dy = player.worldY - b.worldY;
           const dist = Math.sqrt(dx * dx + dy * dy);
           if (dist < player.radius + b.radius) {
-            const finalDmg = Math.ceil(b.damage || 15);
-            player.hp = Math.max(0, player.hp - finalDmg);
-            setPlayerHp(player.hp);
-            triggerCameraShake(12, 4);
-            
-            visualEffects.push({
-              type: "damage_flash",
-              worldX: player.worldX,
-              worldY: player.worldY,
-              life: 20,
-              maxLife: 20,
-              text: `-${finalDmg}`,
-              color: "#ff3333"
-            });
+            const shooterPlayer = otherPlayers[b.shooter];
+            const isShooterProtected = shooterPlayer && shooterPlayer.protectionUntil && shooterPlayer.protectionUntil > Date.now();
 
-            if (player.hp <= 0) {
-              alert(`Zostałeś pokonany przez gracza ${b.shooter}!`);
-              
-              const freshHp = charClass === "wojownik" ? 140 : charClass === "lucznik" ? 105 : 75;
-              const freshMana = charClass === "mag" ? 160 : charClass === "lucznik" ? 100 : 70;
-              const freshStamina = charClass === "lucznik" ? 140 : charClass === "mag" ? 110 : 80;
-              const freshStrengthAttr = charClass === "wojownik" ? 14 : charClass === "mag" ? 4 : 8;
-              const freshEnergyAttr = charClass === "mag" ? 16 : charClass === "lucznik" ? 10 : 6;
-              const freshLifeAttr = charClass === "wojownik" ? 14 : charClass === "lucznik" ? 10 : 7;
-              const freshStaminaAttr = charClass === "lucznik" ? 14 : charClass === "mag" ? 11 : 8;
-
-              player.hp = freshHp;
-              player.maxHp = freshHp;
-              player.mana = freshMana;
-              player.maxMana = freshMana;
-              player.currentStamina = freshStamina;
-              player.maxStamina = freshStamina;
-              player.strength = freshStrengthAttr;
-              player.energy = freshEnergyAttr;
-              player.life = freshLifeAttr;
-              player.stamina = freshStaminaAttr;
-              player.level = 1;
-              player.xp = 0;
-              player.xpNeeded = 100;
-              player.skillPoints = 0;
-              player.statPoints = 0;
-              player.isRunning = false;
-              player.bulletDamage = charClass === "wojownik" ? 52 : charClass === "mag" ? 36 : 28;
-
-              setScore(0);
-              statsRef.current.score = 0;
-              enemies.length = 0;
-              bullets.length = 0;
-              enemyBullets.length = 0;
-              setBossUiActive(false);
-
-              setPlayerHp(player.hp);
-              setPlayerMaxHp(player.maxHp);
-              setPlayerMana(player.mana);
-              setPlayerMaxMana(player.maxMana);
-              setPlayerLvl(player.level);
-              setPlayerXp(player.xp);
-              setPlayerXpNeeded(player.xpNeeded);
-              setStatPoints(player.statPoints);
-              setStatStrength(player.strength);
-              setStatEnergy(player.energy);
-              setStatLife(player.life);
-              setStatStaminaStat(player.stamina);
-              onGameStatsUpdated(1, 0);
-
-              set(ref(db, `players/${currentUser}`), {
-                username: currentUser,
-                worldX: player.worldX,
-                worldY: player.worldY,
-                angle: player.angle,
-                charClass: player.charClass,
-                hp: player.hp,
-                maxHp: player.maxHp,
-                level: player.level,
-                score: statsRef.current.score,
-                lastUpdate: Date.now()
+            if (isShooterProtected) {
+              visualEffects.push({
+                type: "damage_flash",
+                worldX: b.worldX,
+                worldY: b.worldY,
+                life: 25,
+                maxLife: 25,
+                text: "OCHRONA STRZELCA",
+                color: "#95a5a6"
               });
+            } else {
+              const finalDmg = Math.ceil(b.damage || 15);
+              damagePlayer(finalDmg, b.shooter);
+              if (player.hp <= 0) {
+                bullets.splice(i, 1);
+                if (b.id) {
+                  remove(ref(db, `bullets/active/${b.id}`));
+                }
+                return;
+              }
             }
 
             bullets.splice(i, 1);
@@ -1818,10 +2435,9 @@ export default function GameCanvas({
         if (Math.sqrt(edx * edx + edy * edy) < player.radius + eb.radius) {
           // Monster damage includes Admin multiplier strength adjustments!
           const scaledDmg = Math.ceil(12 * mapSettingsRef.current.monsterStrengthMultiplier);
-          player.hp = Math.max(0, player.hp - scaledDmg);
-          setPlayerHp(player.hp);
-          triggerCameraShake(10, 3.5);
+          damagePlayer(scaledDmg, "Boss");
           enemyBullets.splice(i, 1);
+          if (player.hp <= 0) return;
           continue;
         }
 
@@ -1896,10 +2512,9 @@ export default function GameCanvas({
         const edy = player.worldY - eb.worldY;
         if (dashActiveTimer <= 0 && Math.sqrt(edx * edx + edy * edy) < player.radius + eb.radius) {
           const scaledDmg = Math.ceil(12 * mapSettingsRef.current.monsterStrengthMultiplier);
-          player.hp = Math.max(0, player.hp - scaledDmg);
-          setPlayerHp(player.hp);
-          triggerCameraShake(10, 3.5);
+          damagePlayer(scaledDmg, "Boss");
           enemyBullets.splice(i, 1);
+          if (player.hp <= 0) return;
           continue;
         }
 
@@ -1976,8 +2591,8 @@ export default function GameCanvas({
 
               if (dashActiveTimer <= 0 && targetX === player.worldX && targetY === player.worldY && minDist < a.radius + player.radius) {
                 const wildlifeDmg = Math.ceil(a.damage * mapSettingsRef.current.monsterStrengthMultiplier);
-                player.hp = Math.max(0, player.hp - wildlifeDmg);
-                setPlayerHp(player.hp);
+                damagePlayer(wildlifeDmg, a.name);
+                if (player.hp <= 0) return;
               }
             } else {
               a.worldX += (Math.random() - 0.5) * 0.3;
@@ -2052,8 +2667,8 @@ export default function GameCanvas({
           const dist = Math.sqrt(adx * adx + ady * ady);
           if (a.behavior === "aggressive" && dist < a.vision && dist < a.radius + player.radius) {
             const wildlifeDmg = Math.ceil(a.damage * mapSettingsRef.current.monsterStrengthMultiplier);
-            player.hp = Math.max(0, player.hp - wildlifeDmg);
-            setPlayerHp(player.hp);
+            damagePlayer(wildlifeDmg, a.name);
+            if (player.hp <= 0) return;
           }
 
           // Hit detection on animal from non-host bullets
@@ -2395,31 +3010,8 @@ export default function GameCanvas({
 
             if (dashActiveTimer <= 0 && targetX === player.worldX && targetY === player.worldY && distToPlayer < e.radius + player.radius) {
               const hitDamage = Math.ceil(e.damage * mapSettingsRef.current.monsterStrengthMultiplier);
-              player.hp = Math.max(0, player.hp - hitDamage);
-              setPlayerHp(player.hp);
-              triggerCameraShake(10, 3);
-
-              if (player.hp <= 0) {
-                alert(`Koniec Gry! Twój osiągnięty poziom: ${player.level}. Wybierz klasę i zagraj jeszcze raz!`);
-                player.hp = 100;
-                player.level = 1;
-                player.xp = 0;
-                player.xpNeeded = 100;
-                player.skillPoints = 0;
-                setScore(0);
-                statsRef.current.score = 0;
-                enemies.length = 0;
-                bullets.length = 0;
-                enemyBullets.length = 0;
-                setBossUiActive(false);
-
-                setPlayerHp(player.hp);
-                setPlayerLvl(player.level);
-                setPlayerXp(player.xp);
-                setPlayerXpNeeded(player.xpNeeded);
-                onGameStatsUpdated(1, 0);
-                remove(ref(db, `players/${currentUser}`));
-              }
+              damagePlayer(hitDamage, e.name || "Stwora");
+              if (player.hp <= 0) return;
             }
           }
 
@@ -2492,31 +3084,8 @@ export default function GameCanvas({
 
           if (dashActiveTimer <= 0 && e.state === "aggressive" && distToPlayer < e.radius + player.radius) {
             const hitDamage = Math.ceil(e.damage * mapSettingsRef.current.monsterStrengthMultiplier);
-            player.hp = Math.max(0, player.hp - hitDamage);
-            setPlayerHp(player.hp);
-            triggerCameraShake(10, 3);
-
-            if (player.hp <= 0) {
-              alert(`Koniec Gry! Twój osiągnięty poziom: ${player.level}. Wybierz klasę i zagraj jeszcze raz!`);
-              player.hp = 100;
-              player.level = 1;
-              player.xp = 0;
-              player.xpNeeded = 100;
-              player.skillPoints = 0;
-              setScore(0);
-              statsRef.current.score = 0;
-              enemies.length = 0;
-              bullets.length = 0;
-              enemyBullets.length = 0;
-              setBossUiActive(false);
-
-              setPlayerHp(player.hp);
-              setPlayerLvl(player.level);
-              setPlayerXp(player.xp);
-              setPlayerXpNeeded(player.xpNeeded);
-              onGameStatsUpdated(1, 0);
-              remove(ref(db, `players/${currentUser}`));
-            }
+            damagePlayer(hitDamage, e.name || "Stwora");
+            if (player.hp <= 0) return;
           }
 
           for (let j = bullets.length - 1; j >= 0; j--) {
@@ -2617,6 +3186,21 @@ export default function GameCanvas({
             ctx.fillStyle = "#1e8449";
             ctx.beginPath();
             ctx.arc(rx + 32 + pSeed * 20, ry + 32 - pSeed * 20, 8, 0, Math.PI * 1.7);
+            ctx.fill();
+          } else if (currentMapTile === "LAVA" && pSeed < 0.18) {
+            ctx.fillStyle = "rgba(255, 100, 0, 0.4)";
+            ctx.beginPath();
+            ctx.arc(rx + 15 + pSeed * 32, ry + 15 + pSeed * 32, 4 + pSeed * 6, 0, Math.PI * 2);
+            ctx.fill();
+          } else if (currentMapTile === "ICE" && pSeed < 0.2) {
+            ctx.fillStyle = "#ffffff";
+            ctx.beginPath();
+            ctx.arc(rx + 24 + pSeed * 16, ry + 24 + pSeed * 16, 2, 0, Math.PI * 2);
+            ctx.fill();
+          } else if (currentMapTile === "SWAMP" && pSeed < 0.15) {
+            ctx.fillStyle = "#1c2e1f";
+            ctx.beginPath();
+            ctx.ellipse(rx + 32, ry + 32, 10, 4, 0, 0, Math.PI * 2);
             ctx.fill();
           } else if ((currentMapTile === "GRASS" || currentMapTile === "RAINFOREST") && pSeed < 0.25) {
             if (pSeed < 0.08) {
@@ -3009,6 +3593,66 @@ export default function GameCanvas({
           ctx.textAlign = "center";
           ctx.fillText(fx.text || "", drawX, drawY);
           ctx.restore();
+        } else if (fx.type === "ping_pulse") {
+          const progress = 1 - (fx.life / fx.maxLife);
+          const drawX = Math.round(fx.worldX - cameraX);
+          const drawY = Math.round(fx.worldY - cameraY);
+
+          ctx.save();
+
+          // Draw multiple concentric expanding circles
+          for (let r = 0; r < 3; r++) {
+            const rippleProgress = (progress + r * 0.3) % 1;
+            const currentRadius = 15 + rippleProgress * 65;
+            const alpha = (1 - rippleProgress) * (fx.life / fx.maxLife);
+
+            ctx.beginPath();
+            ctx.arc(drawX, drawY, currentRadius, 0, Math.PI * 2);
+            ctx.strokeStyle = fx.color || "#00ffcc";
+            ctx.lineWidth = 3.5 - rippleProgress * 2.5;
+            ctx.shadowBlur = 12;
+            ctx.shadowColor = fx.color || "#00ffcc";
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.stroke();
+            ctx.restore();
+          }
+
+          // Central solid pulsing core
+          const coreAlpha = (fx.life / fx.maxLife) * 0.75;
+          const pulseSize = 7 + Math.sin(Date.now() * 0.02) * 2.5;
+          ctx.beginPath();
+          ctx.arc(drawX, drawY, pulseSize, 0, Math.PI * 2);
+          ctx.fillStyle = fx.color || "#00ffcc";
+          ctx.shadowBlur = 10;
+          ctx.shadowColor = fx.color || "#00ffcc";
+          ctx.save();
+          ctx.globalAlpha = coreAlpha;
+          ctx.fill();
+          ctx.restore();
+
+          // Guidance hover indicator pointer arrow
+          const arrowOffset = 20 + Math.sin(Date.now() * 0.015) * 6;
+          ctx.beginPath();
+          ctx.moveTo(drawX, drawY - arrowOffset - 12);
+          ctx.lineTo(drawX - 6, drawY - arrowOffset - 6);
+          ctx.lineTo(drawX + 6, drawY - arrowOffset - 6);
+          ctx.closePath();
+          ctx.fillStyle = fx.color || "#00ffcc";
+          ctx.shadowBlur = 4;
+          ctx.shadowColor = "black";
+          ctx.fill();
+
+          // Sleek username text labels card
+          ctx.fillStyle = "#ffffff";
+          ctx.font = `bold 10px "JetBrains Mono", monospace`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.shadowColor = "black";
+          ctx.shadowBlur = 5;
+          ctx.fillText(fx.text || "", drawX, drawY - arrowOffset - 15);
+
+          ctx.restore();
         }
       });
 
@@ -3120,6 +3764,10 @@ export default function GameCanvas({
 
         if (opx > -50 && opx < canvas.width + 50 && opy > -50 && opy < canvas.height + 50) {
           ctx.save();
+          const isOpProtected = op.protectionUntil && op.protectionUntil > Date.now();
+          if (isOpProtected) {
+            ctx.globalAlpha = (Math.floor(Date.now() / 250) % 2 === 0) ? 0.25 : 0.75;
+          }
           ctx.translate(opx, opy);
           ctx.rotate(op.angle || 0);
 
@@ -3176,6 +3824,10 @@ export default function GameCanvas({
 
       // Draw Player Hero (pinned to center representing camera target)
       ctx.save();
+      const isSelfProtected = player.protectionUntil && player.protectionUntil > Date.now();
+      if (isSelfProtected) {
+        ctx.globalAlpha = (Math.floor(Date.now() / 250) % 2 === 0) ? 0.25 : 0.75;
+      }
       ctx.translate(screenCenterX, screenCenterY);
 
       ctx.lineWidth = 2;
@@ -3399,6 +4051,28 @@ export default function GameCanvas({
           ctx.fillText(op.username, offsetLeft + opx, offsetTop + opy - 6);
         });
 
+        // Draw active pings on full-screen minimap
+        visualEffects.forEach((fx) => {
+          if (fx.type === "ping_pulse") {
+            const fxX = (fx.worldX / TILE_SIZE) * cellScale;
+            const fxY = (fx.worldY / TILE_SIZE) * cellScale;
+            
+            // Draw a distinct expanding circle indicator
+            const pingRadius = 6 + Math.sin(Date.now() * 0.02) * 3;
+            ctx.beginPath();
+            ctx.arc(offsetLeft + fxX, offsetTop + fxY, pingRadius, 0, Math.PI * 2);
+            ctx.strokeStyle = fx.color || "#00ffcc";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            // Draw center dot
+            ctx.beginPath();
+            ctx.arc(offsetLeft + fxX, offsetTop + fxY, 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = fx.color || "#00ffcc";
+            ctx.fill();
+          }
+        });
+
         // Draw current local player
         const lpx = (player.worldX / TILE_SIZE) * cellScale;
         const lpy = (player.worldY / TILE_SIZE) * cellScale;
@@ -3527,6 +4201,46 @@ export default function GameCanvas({
             ctx.arc(miniCenterX + mdx, miniCenterY + mdy, 2.5, 0, Math.PI * 2);
             ctx.fillStyle = "#ff82ff";
             ctx.fill();
+          }
+        });
+
+        // Draw active pings on small minimap radar
+        visualEffects.forEach((fx) => {
+          if (fx.type === "ping_pulse") {
+            const mdx = (fx.worldX - player.worldX) / scaleFactor;
+            const mdy = (fx.worldY - player.worldY) / scaleFactor;
+            
+            // If the ping is out of the small radar boundary, show an arrow indicator pointing towards it!
+            const distSq = mdx * mdx + mdy * mdy;
+            const boundaryRadius = miniRadius - 4;
+            
+            if (distSq < boundaryRadius * boundaryRadius) {
+              const pingRadius = 4 + Math.sin(Date.now() * 0.02) * 2;
+              ctx.beginPath();
+              ctx.arc(miniCenterX + mdx, miniCenterY + mdy, pingRadius, 0, Math.PI * 2);
+              ctx.strokeStyle = fx.color || "#00ffcc";
+              ctx.lineWidth = 1.2;
+              ctx.stroke();
+
+              ctx.beginPath();
+              ctx.arc(miniCenterX + mdx, miniCenterY + mdy, 1.8, 0, Math.PI * 2);
+              ctx.fillStyle = fx.color || "#00ffcc";
+              ctx.fill();
+            } else {
+              // Draw an edge arrow pointing to the off-screen ping
+              const angle = Math.atan2(mdy, mdx);
+              const edgeX = miniCenterX + Math.cos(angle) * boundaryRadius;
+              const edgeY = miniCenterY + Math.sin(angle) * boundaryRadius;
+              
+              ctx.beginPath();
+              ctx.arc(edgeX, edgeY, 3, 0, Math.PI * 2);
+              ctx.fillStyle = fx.color || "#00ffcc";
+              ctx.fill();
+              
+              ctx.strokeStyle = "#ffffff";
+              ctx.lineWidth = 0.5;
+              ctx.stroke();
+            }
           }
         });
 
@@ -3719,7 +4433,12 @@ export default function GameCanvas({
     const tick = () => {
       if (!isRunning) return;
       if (!chatOverlayActive()) {
-        updateGameElements();
+        if (player.hp <= 0) {
+          respawnPlayer(lastKilledBy);
+          lastKilledBy = undefined;
+        } else {
+          updateGameElements();
+        }
       }
       renderWorkspace();
       animFrameId = requestAnimationFrame(tick);
@@ -3742,6 +4461,13 @@ export default function GameCanvas({
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", onPointerUp);
+
+      try {
+        unsubscribePlayers();
+        unsubscribeEvents();
+        unsubscribeMonsters();
+        unsubscribeAnimals();
+      } catch (e) {}
     };
   }, [charClass, mapSettings, isAdminActive, editorTool, selectedBiome, selectedSpawnType]);
 
@@ -3749,6 +4475,54 @@ export default function GameCanvas({
     <div className="relative w-full h-full select-none overflow-hidden block">
       {/* Canvas */}
       <canvas ref={canvasRef} className="block w-full h-full touch-none z-0" />
+
+      {/* Global Events Journal (Visual log of world events synced in real-time) */}
+      <div className="absolute top-4 right-4 z-10 bg-[#080A0E]/95 border border-white/5 rounded-xl p-4 w-[310px] shadow-2xl space-y-3 font-mono pointer-events-none md:pointer-events-auto select-none">
+        <div className="flex justify-between items-center text-xs border-b border-white/5 pb-2">
+          <div className="flex items-center gap-1.5 font-bold text-white tracking-wider uppercase">
+            <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
+            <span>Dziennik Zdarzeń</span>
+          </div>
+          <span className="text-[9px] text-slate-500 uppercase tracking-widest font-black">Online</span>
+        </div>
+
+        <div className="space-y-1.5 max-h-[220px] overflow-y-auto pr-1 text-[10px] scrollbar-thin scrollbar-thumb-white/5">
+          {globalEvents.length === 0 ? (
+            <div className="text-slate-600 text-center py-4 italic">Brak nowych zdarzeń w świecie gry...</div>
+          ) : (
+            globalEvents.slice(-6).reverse().map((ev) => {
+              let entryClass = "text-slate-300 border-l border-slate-600 pl-1.5";
+              if (ev.type === "death") {
+                entryClass = "text-red-400 font-semibold border-l border-red-500 pl-1.5";
+              } else if (ev.type === "join") {
+                entryClass = "text-emerald-400 font-semibold border-l border-emerald-500 pl-1.5";
+              } else if (ev.type === "kill") {
+                entryClass = "text-amber-400 font-semibold border-l border-amber-500 pl-1.5";
+              } else if (ev.type === "level") {
+                entryClass = "text-fuchsia-400 font-semibold border-l border-fuchsia-500 pl-1.5";
+              } else if (ev.type === "spawn") {
+                entryClass = "text-cyan-400 font-semibold border-l border-cyan-500 pl-1.5";
+              }
+
+              // format time as HH:MM:SS
+              const timeString = new Date(ev.timestamp || Date.now()).toLocaleTimeString("pl-PL", {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit"
+              });
+
+              return (
+                <div key={ev.id} className={`py-1.5 leading-relaxed bg-white/[0.01] hover:bg-white/[0.03] transition-colors rounded px-1 group`}>
+                  <div className="flex items-start gap-1">
+                    <span className="text-slate-500 shrink-0 font-bold select-none">[{timeString}]</span>
+                    <span className={`${entryClass}`}>{ev.text}</span>
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
 
       {/* Visual top bar HUD info of game */}
       <div className="absolute top-4 left-4 z-10 bg-[#080A0E]/95 border border-white/5 rounded-xl p-4 min-w-[240px] shadow-2xl space-y-3 font-mono pointer-events-none md:pointer-events-auto select-none">
@@ -3758,6 +4532,19 @@ export default function GameCanvas({
             Klasa: {charClass.toUpperCase()}
           </span>
         </div>
+
+        {/* PvP Shield Indicator */}
+        {pvpProtected && (
+          <div className="bg-teal-500/10 border border-teal-500/20 text-teal-300 rounded-lg p-2.5 text-[10px] space-y-1 animate-pulse flex flex-col justify-center items-center">
+            <div className="flex items-center gap-1.5 font-bold tracking-wider text-teal-400">
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>OCHRONA PvP AKTYWNA</span>
+            </div>
+            <div className="font-mono text-[9px] text-slate-400">
+              Zostało: <span className="font-bold text-teal-300">{pvpProtectedTimeLeft}s</span>
+            </div>
+          </div>
+        )}
 
         {/* Level metrics */}
         <div className="flex justify-between items-center text-xs text-slate-300 uppercase">
@@ -4145,6 +4932,32 @@ export default function GameCanvas({
             </button>
           );
         })()}
+
+        {/* Look/Spójrz button */}
+        <button
+          onClick={() => {
+            triggerPingCommandRef.current?.("look");
+          }}
+          className="relative flex flex-col items-center justify-center w-15 h-15 rounded-xl border bg-slate-950/70 border-white/5 text-slate-400 hover:bg-slate-900 hover:border-slate-700 transition-all cursor-pointer select-none overflow-hidden"
+          title="SPÓJRZ (Skrót [L] lub przycisk)\nWskazuje Twoją aktualną lokalizację na mapie za pomocą czerwonego wizualnego błysku."
+        >
+          <Eye className="w-4 h-4 mb-0.5 text-rose-400" />
+          <span className="text-[8px] font-black uppercase tracking-wider text-rose-300">SPÓJRZ</span>
+          <span className="text-[6.5px] font-mono text-slate-400 opacity-80 mt-0.5">KLAWISZ L</span>
+        </button>
+
+        {/* Ping/Sygnał button */}
+        <button
+          onClick={() => {
+            triggerPingCommandRef.current?.("ping");
+          }}
+          className="relative flex flex-col items-center justify-center w-15 h-15 rounded-xl border bg-slate-950/70 border-white/5 text-slate-400 hover:bg-slate-900 hover:border-slate-700 transition-all cursor-pointer select-none overflow-hidden"
+          title="SYGNAŁ PING (Skrót [P] lub przycisk)\nWysyła tealowy, wielokolorowy pulsujący sygnał sonarowy do wszystkich graczy."
+        >
+          <MapPin className="w-4 h-4 mb-0.5 text-[#00ffcc]" />
+          <span className="text-[8px] font-black uppercase tracking-wider text-[#00ffcc]">SYGNAŁ</span>
+          <span className="text-[6.5px] font-mono text-[#00ffcc] opacity-80 mt-0.5">KLAWISZ P</span>
+        </button>
 
       </div>
     </div>

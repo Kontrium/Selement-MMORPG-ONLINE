@@ -91,9 +91,20 @@ export default function StartMenu({
           Wstąp do magicznego i pasjonującego świata gry. Wybierz swoją rolę bojową i stań do zorganizowanej walki z mitycznymi bestiami świata Kontrium.
         </p>
         
-        <div className="mt-4 inline-flex items-center gap-2 bg-[#0A0C10] border border-blue-500/20 px-4 py-1.5 rounded text-[10px] text-blue-400 font-mono tracking-wider uppercase">
-          <BookOpen className="w-3.5 h-3.5" />
-          <span>Skrót klawiszowy: <strong className="font-semibold text-white bg-slate-800 px-1.5 py-0.5 rounded">F10</strong> wywołuje panel edycji administracyjnej</span>
+        <div className="mt-4 flex flex-col sm:flex-row justify-center items-center gap-3">
+          <div className="inline-flex items-center gap-2 bg-[#0A0C10] border border-blue-500/20 px-4 py-1.5 rounded text-[10px] text-blue-400 font-mono tracking-wider uppercase">
+            <BookOpen className="w-3.5 h-3.5" />
+            <span>Skrót klawiszowy: <strong className="font-semibold text-white bg-slate-800 px-1.5 py-0.5 rounded">F10</strong> wywołuje panel edycji administracyjnej</span>
+          </div>
+
+          <a
+            href="/index_standalone.html"
+            download="index.html"
+            className="inline-flex items-center gap-2 bg-[#10b981]/15 border border-[#10b981]/30 hover:bg-[#10b981]/25 hover:border-[#10b981]/50 text-emerald-400 px-4 py-1.5 rounded text-[10px] font-bold font-mono tracking-wider uppercase transition-all duration-300 shadow-md hover:-translate-y-0.5 cursor-pointer"
+            title="Pobierz pełną grę jako pojedynczy plik HTML"
+          >
+            📥 POBIERZ standalone index.html
+          </a>
         </div>
       </div>
 

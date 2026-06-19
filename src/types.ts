@@ -10,7 +10,7 @@ export interface UserStats {
   lastUpdate: number;
 }
 
-export type BiomeType = 'WATER' | 'SAND' | 'GRASS' | 'FOREST' | 'RAINFOREST' | 'MOUNTAIN';
+export type BiomeType = 'WATER' | 'SAND' | 'GRASS' | 'FOREST' | 'RAINFOREST' | 'MOUNTAIN' | 'LAVA' | 'ICE' | 'SWAMP';
 
 export interface BiomeConfig {
   id: number;
@@ -72,6 +72,7 @@ export interface PlayerState {
   isRunning: boolean;
   statPoints: number;
   speed: number;
+  protectionUntil?: number;
 }
 
 export interface GameMessage {

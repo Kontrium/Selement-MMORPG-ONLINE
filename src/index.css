@@ -30,3 +30,17 @@ body {
   overflow: hidden;
   margin: 0;
 }
+
+/* Invulnerability Blinking CSS Effects */
+@keyframes protect-blink {
+  0%, 100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.75;
+  }
+}
+
+.protect-pulse-blink {
+  animation: protect-blink 0.5s infinite ease-in-out;
+}

@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { Send, Users, ShieldAlert, X, MessageSquareCode } from "lucide-react";
-import { ref, push, onChildAdded, onValue, set, remove } from "firebase/database";
+import { ref, push, onChildAdded, onValue, set, remove, get } from "firebase/database";
 import { db } from "../lib/firebase";
 import { GameMessage } from "../types";
 
@@ -43,7 +43,10 @@ export default function ChatOverlay({
             id: snapshot.key || String(Date.now()),
             user: data.user,
             text: data.text,
-            timestamp: data.timestamp
+            timestamp: data.timestamp,
+            worldX: data.worldX,
+            worldY: data.worldY,
+            type: data.type
           }
         ]);
       }
@@ -70,14 +73,58 @@ export default function ChatOverlay({
     if (e) e.preventDefault();
     if (!inputText.trim()) return;
 
+    const text = inputText.trim();
     const messagesRef = ref(db, "messages");
-    push(messagesRef, {
-      user: currentUser,
-      text: inputText.trim(),
-      timestamp: Date.now()
-    }).then(() => {
-      setInputText("");
-    });
+
+    // Check for location command keywords
+    const isLook = text.startsWith("/look") || text.startsWith("/spojrz");
+    const isPing = text.startsWith("/ping") || text.startsWith("/sygnal");
+
+    if (isLook || isPing) {
+      const type = isLook ? "look" : "ping";
+      const cleanText = text.replace(/^\/(look|spojrz|ping|sygnal)\s*/i, "");
+      const finalMsg = cleanText ? `${isLook ? "👀 Spójrz:" : "📍 Sygnał:"} ${cleanText}` : (isLook ? "[👀 Spójrz na moją pozycję!]" : "[📍 Wysłałem sygnał lokalizacji]");
+
+      // Fetch sender's active location from the coordinates database
+      get(ref(db, `players/${currentUser}`)).then((snapshot) => {
+        let worldX = 1200;
+        let worldY = 1200;
+        if (snapshot.exists()) {
+          const val = snapshot.val();
+          worldX = val.worldX !== undefined ? val.worldX : worldX;
+          worldY = val.worldY !== undefined ? val.worldY : worldY;
+        }
+
+        push(messagesRef, {
+          user: currentUser,
+          text: finalMsg,
+          timestamp: Date.now(),
+          worldX,
+          worldY,
+          type
+        }).then(() => {
+          setInputText("");
+        });
+      }).catch((err) => {
+        console.error("Failed to fetch coordinates for command:", err);
+        push(messagesRef, {
+          user: currentUser,
+          text: finalMsg,
+          timestamp: Date.now(),
+          type
+        }).then(() => {
+          setInputText("");
+        });
+      });
+    } else {
+      push(messagesRef, {
+        user: currentUser,
+        text: text,
+        timestamp: Date.now()
+      }).then(() => {
+        setInputText("");
+      });
+    }
   };
 
   return (
@@ -125,6 +172,19 @@ export default function ChatOverlay({
               ) : (
                 messages.map((msg) => {
                   const isMe = msg.user === currentUser;
+                  const isPing = msg.type === "ping";
+                  const isLook = msg.type === "look";
+
+                  let bubbleClass = "bg-slate-800/40 border border-white/5 text-slate-300";
+                  if (isMe) {
+                    bubbleClass = "bg-blue-600/10 border border-blue-500/20 text-blue-200";
+                  }
+                  if (isPing) {
+                    bubbleClass = "bg-[#00ffcc]/10 border border-[#00ffcc]/30 text-[#00ffcc] animate-pulse";
+                  } else if (isLook) {
+                    bubbleClass = "bg-red-500/10 border border-red-500/30 text-red-300 animate-pulse";
+                  }
+
                   return (
                     <div
                       key={msg.id}
@@ -132,19 +192,25 @@ export default function ChatOverlay({
                         isMe ? "ml-auto items-end" : "mr-auto items-start"
                       }`}
                     >
-                      <span
-                        onClick={() => onViewProfile(msg.user)}
-                        className="text-[10px] font-mono text-slate-500 hover:text-blue-400 cursor-pointer mb-0.5"
-                      >
-                        @{msg.user}
-                      </span>
-                      <div
-                        className={`rounded-lg py-2 px-4 shadow text-sm break-all font-mono ${
-                          isMe
-                            ? "bg-blue-600/10 border border-blue-500/20 text-blue-200"
-                            : "bg-slate-800/40 border border-white/5 text-slate-300"
-                        }`}
-                      >
+                      <div className="flex items-center gap-1.5 mb-0.5">
+                        <span
+                          onClick={() => onViewProfile(msg.user)}
+                          className="text-[10px] font-mono text-slate-500 hover:text-blue-400 cursor-pointer"
+                        >
+                          @{msg.user}
+                        </span>
+                        {isPing && (
+                          <span className="bg-[#00ffcc]/10 border border-[#00ffcc]/30 text-[#00ffcc] text-[7.5px] px-1.5 py-0.5 rounded uppercase tracking-widest font-mono font-bold scale-90">
+                            Płaski Sygnał
+                          </span>
+                        )}
+                        {isLook && (
+                          <span className="bg-red-500/15 border border-red-500/30 text-red-400 text-[7.5px] px-1.5 py-0.5 rounded uppercase tracking-widest font-mono font-bold scale-90">
+                            Wizja
+                          </span>
+                        )}
+                      </div>
+                      <div className={`rounded-lg py-2 px-4 shadow text-sm break-all font-mono ${bubbleClass}`}>
                         {msg.text}
                       </div>
                     </div>
@@ -203,6 +269,13 @@ export default function ChatOverlay({
                   </span>
                 </div>
               ))}
+            </div>
+
+            <div className="p-4 border-t border-white/5 bg-[#050608]/60 space-y-2 text-[10px] text-slate-500 font-mono select-none">
+              <div className="text-white font-bold tracking-wider text-[11px] mb-1">KOMENDY LOKACJI:</div>
+              <div><strong className="text-teal-400">/ping [tekst]</strong>: Wyślij sygnał</div>
+              <div><strong className="text-rose-400">/look [tekst]</strong>: Zasygnalizuj spojrzenie</div>
+              <div className="text-slate-600 mt-2 text-[9px] leading-relaxed">Sygnały pojawią się w czasie rzeczywistym u wszystkich zalogowanych graczy bezpośrednio na arenie i fali minimapy!</div>
             </div>
           </div>
         </div>

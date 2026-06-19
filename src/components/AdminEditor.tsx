@@ -52,7 +52,10 @@ export default function AdminEditor({
     { type: "SAND", name: "Sand (Piasek)", color: "bg-[#f1c40f]" },
     { type: "FOREST", name: "Forest (Las)", color: "bg-[#1e8449]" },
     { type: "RAINFOREST", name: "Rainforest (Dżungla)", color: "bg-[#117a65]" },
-    { type: "MOUNTAIN", name: "Mountain (Góra)", color: "bg-[#7f8c8d]" }
+    { type: "MOUNTAIN", name: "Mountain (Góra)", color: "bg-[#7f8c8d]" },
+    { type: "LAVA", name: "Lava (Lawa)", color: "bg-[#cf1010]" },
+    { type: "ICE", name: "Ice (Lodowiec)", color: "bg-[#bdecff] text-black border border-white/20" },
+    { type: "SWAMP", name: "Swamp (Bagna)", color: "bg-[#3c4d3d]" }
   ];
 
   const handleUpdateSize = () => {
